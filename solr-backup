@@ -1,0 +1,201 @@
+#!/usr/bin/env python
+
+# import requirements
+import os
+import shutil
+from datetime import datetime
+from lxml import etree as et
+from optparse import OptionParser
+from pipes import quote as shell_quote
+import subprocess 
+import tempfile
+import sys
+sys.path.append('/usr/lib/python3/dist-packages')
+import requests
+
+# setup variables
+solr_url = "http://localhost:8983/solr/"        # solr url ""
+solr_datadir = "/var/solr_project_com/data"
+backup_dir = "/home/project/solrbackup"         # solr backup directory "/home/solr/backup"
+final_dir = "/var/backups/solrsnapshots"
+
+def load_properties(filepath, sep='=', comment_char='#'):
+    props = {}
+    try:
+        with open(filepath, "rt") as f:
+            for line in f:
+                l = line.strip()
+                if l and not l.startswith(comment_char):
+                    key_value = l.split(sep)
+                    props[key_value[0].strip()] = key_value[1].strip('" \t') 
+        return props
+    except:
+    return False
+
+def getxml(url):
+    r = requests.get(url)
+    try:
+        return et.XML(r.text.encode('utf-8'))
+    except:
+        raise
+
+def listcores(solr_url):
+    xml = getxml(solr_url + 'admin/cores?action=STATUS')
+    try:
+        nodes = xml.xpath("/response/lst[@name='status']/lst/str[@name='name']/text()")
+        return nodes
+    except:
+        raise
+
+def backup_status(core):
+    xml = getxml(solr_url + core + '/replication/?command=details')
+    try:
+        nodes = xml.xpath("/response/lst[@name='details']/lst[@name='backup']/str[@name='status']/text()")
+        return nodes
+    except:
+        return False
+
+def copy_conf(core):
+    global solr_datadir, backup_dir
+    for fname in os.listdir(solr_datadir):
+    try:
+        coredir = solr_datadir + "/" + fname
+        props = load_properties (coredir + "/core.properties")
+        try:
+        corename=props['name']
+        if (corename == core):
+            shutil.copytree(coredir+"/conf", backup_dir + "/conf-" + core+"/conf")
+            shutil.copy(coredir+"/core.properties", backup_dir + "/conf-" + core)
+            break
+        except:
+        pass
+    except:
+        pass
+
+
+def solr_initbackup(core, daily):
+    global backup_dir
+    dobackup = True
+
+    for fname in os.listdir(backup_dir):
+    if fname.find(core) > 0:
+        dobackup = False
+        break
+
+    if (daily == False):
+    file = open(backup_dir + "/backup.weekly",'w')
+    file.close()
+
+    if dobackup:
+    backup_name = "solr-"+core+"-backup-" + datetime.now().strftime("%Y-%M-%d-%H-%M")
+    url = solr_url + core + "/replication?command=backup&location="+backup_dir+"&name="+backup_name+"&wt=json"
+    res = requests.get(url)
+    copy_conf(core)
+    else:
+    print "Error: backup for core " + core + " already found; core backup directory must be empty! (before new backup)"
+
+def solr_compressbackup(core):
+    global backup_dir,final_dir
+
+    file=""
+    daily=True
+    backup_filename=""
+    lockfilename = backup_dir + "/backup.lock"
+    backup_lpart = ""
+    if os.listdir(backup_dir) == []:
+    return
+
+    try:
+        open(backup_dir + "/backup.weekly",'r')
+        daily = False
+        file.close()
+    except:
+    pass
+
+    tempdir = tempfile.mkdtemp()
+
+    if(daily == False):
+    backup_lpart+= "-weekly"
+    backup_name =  datetime.now().strftime("%Y-%M-%d-%H-%M") +"-solr-dbbackup" + backup_lpart
+
+    if tempdir:
+    try:
+        shutil.copy(solr_datadir + "/solr.xml", backup_dir)
+        shutil.copy(solr_datadir + "/zoo.cfg", backup_dir)
+        shutil.copy("/etc/default/dev_solr_project_com.in.sh", backup_dir)
+        shutil.copy("/etc/default/solr_project_com.in.sh", backup_dir)
+        shutil.copy("/etc/init.d/solr_project_com", backup_dir)
+        shutil.copy("/etc/init.d/dev_solr_project_com", backup_dir)
+    except:
+        pass
+    print "Compressing backup, daily=", daily
+    backup_filename = tempdir + "/" + backup_name+".tar.gz"
+    subprocess.call(["tar", "zcf", backup_filename, "."], cwd=backup_dir);
+    shutil.move(backup_filename, final_dir)
+    print "Compressed."
+    if backup_dir:
+        subprocess.call("rm -r " + shell_quote (backup_dir) + "/*", shell=True)
+        subprocess.call("ls -C1 -t "+shell_quote(final_dir)+"/*solr-dbbackup.tar.gz|awk 'NR>5'|sed -e \"s/^/rm '/\" -e \"s/$/'/\" | sh", shell=True);
+        subprocess.call("ls -C1 -t "+shell_quote(final_dir)+"/*solr-dbbackup-weekly.tar.gz|awk 'NR>5'|sed -e \"s/^/rm '/\" -e \"s/$/'/\" | sh", shell=True);
+    subprocess.call("rmdir " + shell_quote (tempdir), shell=True)
+    #copy files
+    #copy configs
+    #compress file
+    #move to dropbox dir and check for five recent backups
+
+
+
+def solr_backup(action, daily = False):
+    # set backup name
+    global solr_url, backup_dir
+    backup_done = True
+    
+    cores = listcores(solr_url)
+    
+    
+    for core in cores:
+        if (backup_status(core) == ['success']):
+        if (action == True):
+            print "Action: init, core: " + core
+            solr_initbackup(core, daily)
+
+        elif (not backup_status(core)):
+        if (action == True):
+            print "Action: init first backup, core: " + core
+            solr_initbackup(core, daily)
+        elif (action == Flase):
+        backup_done = False
+        break
+
+    if (backup_done and (action == False)):
+#           print "Action: compress"
+        solr_compressbackup(core)
+
+
+if __name__ == '__main__':
+    parser = OptionParser(usage='Usage: %prog -a [action] mode')
+    parser.add_option("-a", "--action", action="store", dest="action", default=False, help="Set mode - initbackup or compress")
+    (options, args) = parser.parse_args()
+    lastarg = ""
+    daily = False
+    try:
+        lastarg = args[0]
+    except:
+        pass
+
+    if (lastarg == "daily"):
+        daily = True
+    elif (lastarg == "weekly"):
+        daily = False
+    elif (options.action != "compress"):
+        parser.print_help()
+        print "Mode must be set - daily or weekly"
+        raise SystemExit, 0
+
+    if (options.action == "initbackup"):
+        solr_backup(True, daily)
+    elif (options.action == "compress"):
+        solr_backup(False)
+    else:
+        parser.print_help()
+
